@@ -1,171 +1,160 @@
+// server.js – SnapChaos Socket Server (Render)
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
-import cors from "cors";
-import { nanoid } from "nanoid";
-import { PROMPTS } from "./prompts.js";
 
 const app = express();
-app.use(cors());
-
 const server = http.createServer(app);
+
+/**
+ * Allow sockets only from your frontend (Vercel) and local dev.
+ * (Render URL is included harmlessly.)
+ */
+const FRONTEND_ORIGINS = [
+  "https://snap-chaos.vercel.app",
+  "http://localhost:3000",
+  "https://snapchaos-socket.onrender.com"
+];
+
 const io = new Server(server, {
   cors: {
-    origin: "*", // lock this down later to your Vercel domain(s)
-    methods: ["GET", "POST"]
-  }
+    origin: FRONTEND_ORIGINS,
+    methods: ["GET", "POST"],
+  },
+  // path: "/socket.io" // default; keep as-is
 });
 
-// In-memory rooms (works because this process is long-lived on Render)
-const rooms = new Map();
+// -------- Tiny in-memory room store --------
+const rooms = new Map(); // code -> { started, hostId, players: Map(socketId -> {id,name,isHost}) }
 
-const ensureRoom = (code) => {
-  if (!rooms.has(code)) {
-    rooms.set(code, {
-      code,
-      hostId: null,
-      players: new Map(),
-      mode: null,
-      round: 0,
-      prompt: null,
-      deadline: null,
-      submissions: [],
-      votes: new Map(),
-      rejections: new Map(),
-    });
-  }
-  return rooms.get(code);
-};
+function makeCode() {
+  return Math.random().toString(36).slice(2, 6).toUpperCase();
+}
 
-const serializeRoom = (room) => ({
-  code: room.code,
-  hostId: room.hostId,
-  players: Array.from(room.players, ([sid, p]) => ({ sid, name: p.name, score: p.score })),
-  mode: room.mode,
-  round: room.round,
-});
+function getPublicState(room) {
+  return {
+    started: !!room.started,
+    players: Array.from(room.players.values()).map(p => ({
+      id: p.id, name: p.name, isHost: !!p.isHost
+    })),
+  };
+}
 
-const serializeScores = (room) =>
-  Array.from(room.players, ([sid, p]) => ({ sid, name: p.name, score: p.score }));
-
+// --------------- Socket logic ---------------
 io.on("connection", (socket) => {
-  socket.on("create_room", ({ name }, cb) => {
-    const code = nanoid(4).toUpperCase();
-    const room = ensureRoom(code);
-    room.hostId = socket.id;
-    room.players.set(socket.id, { name: name || "Host", score: 0 });
-    socket.join(code);
-    cb && cb({ code });
-    io.to(code).emit("room_update", serializeRoom(room));
+  console.log("✅ connected:", socket.id);
+
+  socket.on("create_room", ({ name }, ack) => {
+    console.log("➡️ create_room", { sock: socket.id, name });
+    const code = makeCode();
+    rooms.set(code, { started: false, hostId: null, players: new Map() });
+    ack?.({ code });
+    console.log("✅ room created", code);
   });
 
-  socket.on("join_room", ({ code, name }, cb) => {
-    const room = ensureRoom(code);
-    room.players.set(socket.id, { name: name || "Guest", score: 0 });
-    socket.join(code);
-    if (!room.hostId) room.hostId = socket.id; // auto-promote first joiner to host if needed
-    cb && cb({ ok: true, room: serializeRoom(room) });
-    io.to(code).emit("room_update", serializeRoom(room));
-  });
+  socket.on("join_room", (payload, ack) => {
+    let { code, name, isHost } = payload || {};
+    code = (code || "").toUpperCase();
+    name = name || "Player";
 
-  socket.on("start_round", ({ code, mode, durationSec }, cb) => {
-    const room = rooms.get(code);
-    if (!room || room.hostId !== socket.id) return;
-    room.mode = mode;
-    room.round += 1;
-    room.prompt = PROMPTS[Math.floor(Math.random() * PROMPTS.length)];
-    room.deadline = Date.now() + (durationSec || 30) * 1000;
-    room.submissions = [];
-    room.votes = new Map();
-    room.rejections = new Map();
-    io.to(code).emit("round_started", {
-      round: room.round,
-      mode: room.mode,
-      prompt: room.prompt,
-      deadline: room.deadline,
-    });
-    cb && cb({ ok: true });
-  });
-
-  socket.on("submit_photo", ({ code, dataURL }, cb) => {
-    const room = rooms.get(code);
-    if (!room) return;
-    const already = room.submissions.find((s) => s.sid === socket.id);
-    if (!already) room.submissions.push({ sid: socket.id, dataURL });
-    else already.dataURL = dataURL;
-    io.to(code).emit("submission_update", { count: room.submissions.length });
-    cb && cb({ ok: true });
-  });
-
-  socket.on("vote_best", ({ code, targetSid }, cb) => {
-    const room = rooms.get(code);
-    if (!room) return;
-    room.votes.set(socket.id, targetSid);
-    io.to(code).emit("vote_update", { votes: room.votes.size });
-    cb && cb({ ok: true });
-  });
-
-  socket.on("flag_lazy", ({ code, targetSid }, cb) => {
-    const room = rooms.get(code);
-    if (!room) return;
-    if (!room.rejections.has(targetSid)) room.rejections.set(targetSid, new Set());
-    room.rejections.get(targetSid).add(socket.id);
-    io.to(code).emit("rejection_update", { targetSid, count: room.rejections.get(targetSid).size });
-    cb && cb({ ok: true });
-  });
-
-  socket.on("end_round", ({ code }, cb) => {
-    const room = rooms.get(code);
-    if (!room || room.hostId !== socket.id) return;
-    const totalPlayers = room.players.size;
-    const majority = Math.floor(totalPlayers / 2) + 1;
-    const submittedSids = new Set(room.submissions.map((s) => s.sid));
-
-    for (const [sid, p] of room.players.entries()) {
-      if (!submittedSids.has(sid)) p.score -= 2;
-      else p.score += 1;
+    if (!rooms.has(code)) {
+      rooms.set(code, { started: false, hostId: null, players: new Map() });
     }
-    for (const [targetSid, voters] of room.rejections.entries()) {
-      if (voters.size >= majority) {
-        const target = room.players.get(targetSid);
-        if (target) target.score -= 2;
+    const room = rooms.get(code);
+
+    console.log("➡️ join_room", { code, socket: socket.id, name, isHost });
+    socket.join(code);
+
+    // set host if requested and none set yet
+    if (isHost || !room.hostId) {
+      room.hostId = socket.id;
+    }
+
+    room.players.set(socket.id, {
+      id: socket.id,
+      name,
+      isHost: socket.id === room.hostId,
+    });
+
+    // ensure only the host entry has isHost=true
+    for (const [, player] of room.players) {
+      player.isHost = player.id === room.hostId;
+    }
+
+    // reply to the joiner with current state
+    ack?.(null, getPublicState(room));
+    // notify everyone in the room
+    io.to(code).emit("room_update", getPublicState(room));
+    console.log("✅ join_room handled", {
+      code,
+      hostId: room.hostId,
+      players: room.players.size,
+    });
+  });
+
+  socket.on("start_game", ({ code }, ack) => {
+    code = (code || "").toUpperCase();
+    console.log("➡️ start_game", { code, socket: socket.id });
+    const room = rooms.get(code);
+    if (!room) {
+      console.log("❌ start_game no room", code);
+      return ack?.({ message: "Room not found" });
+    }
+
+    if (socket.id !== room.hostId) {
+      console.log("❌ start_game bad host", { code, socket: socket.id, hostId: room.hostId });
+      return ack?.({ message: "Only host can start" });
+    }
+
+    room.started = true;
+    io.to(code).emit("game_started");
+    io.to(code).emit("room_update", getPublicState(room));
+    ack?.(null, { ok: true });
+    console.log("✅ start_game ok", { code, socket: socket.id });
+  });
+
+  socket.on("leave_room", ({ code }) => {
+    code = (code || "").toUpperCase();
+    const room = rooms.get(code);
+    if (!room) return;
+
+    socket.leave(code);
+    room.players.delete(socket.id);
+
+    if (socket.id === room.hostId) {
+      room.hostId = null;
+      const first = room.players.values().next().value;
+      if (first) {
+        room.hostId = first.id;
+        first.isHost = true;
       }
     }
-    const tally = {};
-    for (const [, targetSid] of room.votes.entries()) {
-      tally[targetSid] = (tally[targetSid] || 0) + 1;
-    }
-    const maxVotes = Math.max(0, ...Object.values(tally));
-    const winners = Object.keys(tally).filter((sid) => tally[sid] === maxVotes);
-    winners.forEach((sid) => {
-      const w = room.players.get(sid);
-      if (w) w.score += 2;
-    });
-
-    io.to(code).emit("round_results", {
-      prompt: room.prompt,
-      submissions: room.submissions.map((s) => ({ sid: s.sid, dataURL: s.dataURL })),
-      votes: tally,
-      winners,
-      scores: serializeScores(room),
-    });
-    cb && cb({ ok: true });
+    io.to(code).emit("room_update", getPublicState(room));
   });
 
   socket.on("disconnect", () => {
-    for (const room of rooms.values()) {
+    for (const [code, room] of rooms) {
       if (room.players.has(socket.id)) {
         room.players.delete(socket.id);
-        if (room.hostId === socket.id) {
-          const [nextHost] = room.players.keys();
-          room.hostId = nextHost || null;
+        if (socket.id === room.hostId) {
+          room.hostId = null;
+          const first = room.players.values().next().value;
+          if (first) {
+            room.hostId = first.id;
+            first.isHost = true;
+          }
         }
-        io.to(room.code).emit("room_update", serializeRoom(room));
+        io.to(code).emit("room_update", getPublicState(room));
       }
     }
   });
 });
 
-app.get("/", (_req, res) => res.send("SnapChaos Socket Server is running"));
+// simple health check
+app.get("/", (_req, res) => res.send("SnapChaos socket server ✅"));
+
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log(`Socket server on :${PORT}`));
+server.listen(PORT, () => {
+  console.log("🚀 Socket server listening on", PORT);
+  console.log("CORS origins:", FRONTEND_ORIGINS);
+});
